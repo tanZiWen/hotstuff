@@ -19,13 +19,15 @@ use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use crypto::Digest;
 use std::convert::TryInto;
-
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
 pub const LASTEST_ROUND: &str = "latest_round";
+const CONSENSUS_STATE_KEY: &str = "consensus_state";
+
 pub struct Core {
     name: PublicKey,
     committee: Committee,
@@ -44,6 +46,15 @@ pub struct Core {
     timer: Timer,
     aggregator: Aggregator,
     network: SimpleSender,
+    state_changed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ConsensusState {
+    round: Round,
+    last_voted_round: Round,
+    last_committed_round: Round,
+    high_qc: QC,
 }
 
 impl Core {
@@ -61,7 +72,18 @@ impl Core {
         tx_proposer: Sender<ProposerMessage>,
         tx_commit: Sender<Block>,
     ) {
+           
         tokio::spawn(async move {
+            let state = store.clone()
+            .read(CONSENSUS_STATE_KEY.as_bytes().to_vec())
+            .await.unwrap_or_default()
+                .map(|bytes| bincode::deserialize(&bytes).expect("Failed to deserialize consensus state"))
+                .unwrap_or_else(|| ConsensusState {
+                    round: 1,
+                    last_voted_round: 0,
+                    last_committed_round: 0,
+                    high_qc: QC::genesis(),
+                });
             Self {
                 name,
                 committee: committee.clone(),
@@ -73,13 +95,14 @@ impl Core {
                 rx_loopback,
                 tx_proposer,
                 tx_commit,
-                round: 1,
-                last_voted_round: 0,
-                last_committed_round: 0,
-                high_qc: QC::genesis(),
+                round: state.round,
+                last_voted_round: state.last_voted_round,
+                last_committed_round: state.last_committed_round,
+                high_qc: state.high_qc,
                 timer: Timer::new(timeout_delay),
                 aggregator: Aggregator::new(committee),
                 network: SimpleSender::new(),
+                state_changed: false,
             }
             .run()
             .await
@@ -124,8 +147,14 @@ impl Core {
     
     }
 
+    async fn persist_state(&mut self, state: &ConsensusState) {
+        let serialized_state = bincode::serialize(state).expect("Failed to serialize consensus state");
+        self.store.write(CONSENSUS_STATE_KEY.as_bytes().to_vec(), serialized_state).await;
+    }
+
     fn increase_last_voted_round(&mut self, target: Round) {
         self.last_voted_round = max(self.last_voted_round, target);
+        self.state_changed = true;
     }
 
     async fn make_vote(&mut self, block: &Block) -> Option<Vote> {
@@ -168,6 +197,7 @@ impl Core {
 
         // Save the last committed block.
         self.last_committed_round = block.round;
+        self.state_changed = true;
 
         // Send all the newly committed blocks to the node's application layer.
         while let Some(block) = to_commit.pop_back() {
@@ -183,6 +213,7 @@ impl Core {
     fn update_high_qc(&mut self, qc: &QC) {
         if qc.round > self.high_qc.round {
             self.high_qc = qc.clone();
+            self.state_changed = true;
         }
     }
 
@@ -298,6 +329,7 @@ impl Core {
         // Reset the timer and advance round.
         self.timer.reset();
         self.round = round + 1;
+        self.state_changed = true;
         debug!("Moved to round {}", self.round);
 
         // Cleanup the vote aggregator.
@@ -377,6 +409,7 @@ impl Core {
                 self.network.send(address, Bytes::from(message)).await;
             }
         }
+
         Ok(())
     }
 
@@ -447,6 +480,15 @@ impl Core {
                 Err(ConsensusError::StoreError(e)) => error!("{}", e),
                 Err(ConsensusError::SerializationError(e)) => error!("Store corrupted. {}", e),
                 Err(e) => warn!("{}", e),
+            }
+            if self.state_changed {
+                self.persist_state(&ConsensusState {
+                    round: self.round,
+                    last_voted_round: self.last_voted_round,
+                    last_committed_round: self.last_committed_round,
+                    high_qc: self.high_qc.clone(),
+                }).await;
+                self.state_changed = false;
             }
         }
     }

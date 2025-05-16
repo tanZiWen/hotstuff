@@ -137,6 +137,9 @@ impl Proposer {
                     .read(LASTEST_ROUND.as_bytes().to_vec())
                     .await
                     .unwrap_or_default();
+        if latest_round.is_none() {
+            return vec![];
+        }
         let last_round: u64 = u64::from_be_bytes(latest_round.unwrap().try_into().expect("Expected a Vec<u8> of length 8"));
 
         let store_payload = self.store.read(last_round.to_be_bytes().to_vec()).await.unwrap_or_default();
