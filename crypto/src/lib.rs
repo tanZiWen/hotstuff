@@ -29,6 +29,13 @@ impl Digest {
     pub fn size(&self) -> usize {
         self.0.len()
     }
+    
+    pub fn random() -> Self {
+        let mut rng = OsRng; 
+        let mut bytes = [0u8; 32]; 
+        rng.fill_bytes(&mut bytes); 
+        Digest(bytes)
+    }
 }
 
 impl fmt::Debug for Digest {

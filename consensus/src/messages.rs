@@ -19,7 +19,7 @@ pub struct Block {
     pub tc: Option<TC>,
     pub author: PublicKey,
     pub round: Round,
-    pub payload: Vec<Digest>,
+    pub payload: Digest,
     pub signature: Signature,
 }
 
@@ -29,7 +29,7 @@ impl Block {
         tc: Option<TC>,
         author: PublicKey,
         round: Round,
-        payload: Vec<Digest>,
+        payload: Digest,
         mut signature_service: SignatureService,
     ) -> Self {
         let block = Self {
@@ -80,10 +80,8 @@ impl Hash for Block {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(self.author.0);
-        hasher.update(self.round.to_le_bytes());
-        for x in &self.payload {
-            hasher.update(x);
-        }
+        hasher.update(self.round.to_le_bytes()); 
+        hasher.update(self.payload.to_vec());
         hasher.update(&self.qc.hash);
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
@@ -98,7 +96,7 @@ impl fmt::Debug for Block {
             self.author,
             self.round,
             self.qc,
-            self.payload.iter().map(|x| x.size()).sum::<usize>(),
+            self.payload,
         )
     }
 }

@@ -3,7 +3,6 @@ use crate::config::Committee;
 use crate::consensus::{ConsensusMessage, Round};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
-use crate::mempool::MempoolDriver;
 use crate::messages::{Block, Timeout, Vote, QC, TC};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
@@ -18,18 +17,21 @@ use std::cmp::max;
 use std::collections::VecDeque;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use crypto::Digest;
+use std::convert::TryInto;
+
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
+pub const LASTEST_ROUND: &str = "latest_round";
 pub struct Core {
     name: PublicKey,
     committee: Committee,
     store: Store,
     signature_service: SignatureService,
     leader_elector: LeaderElector,
-    mempool_driver: MempoolDriver,
     synchronizer: Synchronizer,
     rx_message: Receiver<ConsensusMessage>,
     rx_loopback: Receiver<Block>,
@@ -52,7 +54,6 @@ impl Core {
         signature_service: SignatureService,
         store: Store,
         leader_elector: LeaderElector,
-        mempool_driver: MempoolDriver,
         synchronizer: Synchronizer,
         timeout_delay: u64,
         rx_message: Receiver<ConsensusMessage>,
@@ -67,7 +68,6 @@ impl Core {
                 signature_service,
                 store,
                 leader_elector,
-                mempool_driver,
                 synchronizer,
                 rx_message,
                 rx_loopback,
@@ -90,6 +90,38 @@ impl Core {
         let key = block.digest().to_vec();
         let value = bincode::serialize(block).expect("Failed to serialize block");
         self.store.write(key, value).await;
+
+        // Store the payload hashes in the store.
+        let latest_round = self
+            .store
+            .read(LASTEST_ROUND.as_bytes().to_vec())
+            .await
+            .unwrap_or_default();
+        
+        let mut round: u64 = 0;
+        if !latest_round.is_none() {
+            round = u64::from_be_bytes(latest_round.unwrap().try_into().expect("Expected a Vec<u8> of length 8"));       
+        }
+        let mut payload_hashes = Vec::<Digest>::new();
+
+        if round == block.round {
+            let store_payload = self.store.read(block.round.to_be_bytes().to_vec()).await.unwrap_or_default();
+            payload_hashes = bincode::deserialize::<Vec<Digest>>(&store_payload.unwrap_or_default()).unwrap_or_default();
+           
+            if !payload_hashes.contains(&block.payload) {
+               payload_hashes.push(block.payload.clone());
+            }
+        } else if round < block.round {
+            payload_hashes.push(block.payload.clone());
+        } else {
+            warn!("The block round is less than the last round");
+            return;
+        }
+        let payload_hashes_se = bincode::serialize(&payload_hashes).unwrap();
+        self.store.write(block.round.to_be_bytes().to_vec(), payload_hashes_se).await;
+        self.store.write(LASTEST_ROUND.as_bytes().to_vec(), block.round.to_be_bytes().to_vec()).await;
+        info!("store block sucess: {:?}", payload_hashes);
+    
     }
 
     fn increase_last_voted_round(&mut self, target: Round) {
@@ -139,20 +171,12 @@ impl Core {
 
         // Send all the newly committed blocks to the node's application layer.
         while let Some(block) = to_commit.pop_back() {
-            if !block.payload.is_empty() {
-                info!("Committed {}", block);
-
-                #[cfg(feature = "benchmark")]
-                for x in &block.payload {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", block, x);
-                }
-            }
             debug!("Committed {:?}", block);
             if let Err(e) = self.tx_commit.send(block).await {
                 warn!("Failed to send block through the commit channel: {}", e);
             }
         }
+        info!("Committed block {:?}", block.round);
         Ok(())
     }
 
@@ -267,6 +291,7 @@ impl Core {
 
     #[async_recursion]
     async fn advance_round(&mut self, round: Round) {
+        // old round ingore
         if round < self.round {
             return;
         }
@@ -288,15 +313,9 @@ impl Core {
     }
 
     async fn cleanup_proposer(&mut self, b0: &Block, b1: &Block, block: &Block) {
-        let digests = b0
-            .payload
-            .iter()
-            .cloned()
-            .chain(b1.payload.iter().cloned())
-            .chain(block.payload.iter().cloned())
-            .collect();
+        let rounds = vec![b0.round, b1.round, block.round];
         self.tx_proposer
-            .send(ProposerMessage::Cleanup(digests))
+            .send(ProposerMessage::Cleanup(rounds))
             .await
             .expect("Failed to send message to proposer");
     }
@@ -331,7 +350,6 @@ impl Core {
         // Check if we can commit the head of the 2-chain.
         // Note that we commit blocks only if we have all its ancestors.
         if b0.round + 1 == b1.round {
-            self.mempool_driver.cleanup(b0.round).await;
             self.commit(b0).await?;
         }
 
@@ -345,7 +363,7 @@ impl Core {
         // See if we can vote for this block.
         if let Some(vote) = self.make_vote(block).await {
             debug!("Created {:?}", vote);
-            let next_leader = self.leader_elector.get_leader(self.round + 1);
+            let next_leader: PublicKey = self.leader_elector.get_leader(self.round + 1);
             if next_leader == self.name {
                 self.handle_vote(&vote).await?;
             } else {
@@ -384,13 +402,6 @@ impl Core {
         // Process the TC (if any). This may also allow us to advance round.
         if let Some(ref tc) = block.tc {
             self.advance_round(tc.round).await;
-        }
-
-        // Let's see if we have the block's data. If we don't, the mempool
-        // will get it and then make us resume processing this block.
-        if !self.mempool_driver.verify(block.clone()).await? {
-            debug!("Processing of {} suspended: missing payload", digest);
-            return Ok(());
         }
 
         // All check pass, we can process this block.

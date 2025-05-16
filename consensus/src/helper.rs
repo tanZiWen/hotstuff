@@ -59,7 +59,7 @@ impl Helper {
             {
                 let block =
                     bincode::deserialize(&bytes).expect("Failed to deserialize our own block");
-                let message = bincode::serialize(&ConsensusMessage::Propose(block))
+                let message: Vec<u8> = bincode::serialize(&ConsensusMessage::Propose(block))
                     .expect("Failed to serialize block");
                 self.network.send(address, Bytes::from(message)).await;
             }

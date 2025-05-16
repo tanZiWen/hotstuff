@@ -1,5 +1,6 @@
 use crate::config::{Committee, Stake};
 use crate::consensus::{ConsensusMessage, Round};
+use crate::core::LASTEST_ROUND;
 use crate::messages::{Block, QC, TC};
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, SignatureService};
@@ -7,24 +8,28 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, info};
 use network::{CancelHandler, ReliableSender};
-use std::collections::HashSet;
 use tokio::sync::mpsc::{Receiver, Sender};
+use std::collections::HashMap;
+use rand::prelude::*;
+use store::Store;
+use std::convert::TryInto;
 
 #[derive(Debug)]
 pub enum ProposerMessage {
     Make(Round, QC, Option<TC>),
-    Cleanup(Vec<Digest>),
+    Cleanup(Vec<u64>),
 }
 
 pub struct Proposer {
     name: PublicKey,
     committee: Committee,
     signature_service: SignatureService,
-    rx_mempool: Receiver<Digest>,
+    rx_producer: Receiver<Digest>,
     rx_message: Receiver<ProposerMessage>,
     tx_loopback: Sender<Block>,
-    buffer: HashSet<Digest>,
+    buffer: HashMap<Round, Vec<Digest>>,
     network: ReliableSender,
+    store: Store,
 }
 
 impl Proposer {
@@ -32,20 +37,22 @@ impl Proposer {
         name: PublicKey,
         committee: Committee,
         signature_service: SignatureService,
-        rx_mempool: Receiver<Digest>,
+        rx_producer: Receiver<Digest>,
         rx_message: Receiver<ProposerMessage>,
         tx_loopback: Sender<Block>,
+        store: Store,
     ) {
         tokio::spawn(async move {
             Self {
                 name,
                 committee,
                 signature_service,
-                rx_mempool,
+                rx_producer,
                 rx_message,
                 tx_loopback,
-                buffer: HashSet::new(),
+                buffer: HashMap::new(),
                 network: ReliableSender::new(),
+                store,
             }
             .run()
             .await;
@@ -59,26 +66,29 @@ impl Proposer {
     }
 
     async fn make_block(&mut self, round: Round, qc: QC, tc: Option<TC>) {
+        let lastest_round = self.get_lastest_round().await;
+
+        let payload_round = lastest_round + 1;
+        let payload = self.buffer.get(&payload_round);
+
+        if payload.is_none() {
+            // No payloads to propose.
+            info!("Round: {:?}, No payloads to propose", round);
+            return;
+        }
+        let mut rng: StdRng = StdRng::from_entropy();
+        let payload = payload.and_then(|digests| digests.choose(&mut rng)).cloned().unwrap();
         // Generate a new block.
         let block = Block::new(
             qc,
             tc,
             self.name,
             round,
-            /* payload */ self.buffer.drain().collect(),
+            payload,
             self.signature_service.clone(),
         )
         .await;
 
-        if !block.payload.is_empty() {
-            info!("Created {}", block);
-
-            #[cfg(feature = "benchmark")]
-            for x in &block.payload {
-                // NOTE: This log entry is used to compute performance.
-                info!("Created {} -> {:?}", block, x);
-            }
-        }
         debug!("Created {:?}", block);
 
         // Broadcast our new block.
@@ -121,18 +131,47 @@ impl Proposer {
         }
     }
 
+    async fn get_lastest_payload(&mut self) -> Vec<Digest>{
+        let latest_round = self
+                    .store
+                    .read(LASTEST_ROUND.as_bytes().to_vec())
+                    .await
+                    .unwrap_or_default();
+        let last_round: u64 = u64::from_be_bytes(latest_round.unwrap().try_into().expect("Expected a Vec<u8> of length 8"));
+
+        let store_payload = self.store.read(last_round.to_be_bytes().to_vec()).await.unwrap_or_default();
+        bincode::deserialize::<Vec<Digest>>(&store_payload.unwrap_or_default()).unwrap_or_default()
+    }
+
+    async fn get_lastest_round(&mut self) -> u64 {
+        let latest_round = self
+            .store
+            .read(LASTEST_ROUND.as_bytes().to_vec())
+            .await
+            .unwrap_or_default();
+        if latest_round.is_none() {
+            return 0;
+        }
+        u64::from_be_bytes(latest_round.unwrap().try_into().expect("Expected a Vec<u8> of length 8")) 
+    }
+
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                Some(digest) = self.rx_mempool.recv() => {
-                    //if self.buffer.len() < 155 {
-                        self.buffer.insert(digest);
-                    //}
+                Some(digest) = self.rx_producer.recv() => {
+                    info!("Received payload: {:?}", digest);
+                    //TODO: Check if the digest is legal, zk-verify.
+                    //TODO: Check if the sender is the producers
+                    let lastest_round = self.get_lastest_round().await;
+                    info!("Lastest round: {:?}", lastest_round);
+                    self.buffer.entry(lastest_round+1)
+                        .or_insert_with(Vec::new)
+                        .push(digest.clone());
                 },
                 Some(message) = self.rx_message.recv() => match message {
                     ProposerMessage::Make(round, qc, tc) => self.make_block(round, qc, tc).await,
-                    ProposerMessage::Cleanup(digests) => {
-                        for x in &digests {
+                    ProposerMessage::Cleanup(rounds) => {
+                        for x in &rounds {
                             self.buffer.remove(x);
                         }
                     }
@@ -141,3 +180,4 @@ impl Proposer {
         }
     }
 }
+

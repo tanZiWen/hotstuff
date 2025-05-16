@@ -18,14 +18,12 @@ fn core(
     let (tx_core, rx_core) = channel(1);
     let (tx_loopback, rx_loopback) = channel(1);
     let (tx_proposer, rx_proposer) = channel(1);
-    let (tx_mempool, mut rx_mempool) = channel(1);
     let (tx_commit, rx_commit) = channel(1);
 
     let signature_service = SignatureService::new(secret);
     let _ = fs::remove_dir_all(store_path);
     let store = Store::new(store_path).unwrap();
     let leader_elector = LeaderElector::new(committee.clone());
-    let mempool_driver = MempoolDriver::new(store.clone(), tx_mempool, tx_loopback.clone());
     let synchronizer = Synchronizer::new(
         name,
         committee.clone(),
@@ -34,19 +32,12 @@ fn core(
         /* sync_retry_delay */ 100_000,
     );
 
-    tokio::spawn(async move {
-        loop {
-            rx_mempool.recv().await;
-        }
-    });
-
     Core::spawn(
         name,
         committee,
         signature_service,
         store,
         leader_elector,
-        mempool_driver,
         synchronizer,
         /* timeout_delay */ 100,
         /* rx_message */ rx_core,
@@ -100,7 +91,7 @@ async fn generate_proposal() {
     let (next_leader, next_leader_key) = leader_keys(2);
 
     // Make a block, votes, and QC.
-    let block = Block::new_from_key(QC::genesis(), leader, 1, Vec::new(), &leader_key);
+    let block = Block::new_from_key(QC::genesis(), leader, 1, Digest::default(), &leader_key);
     let hash = block.digest();
     let votes: Vec<_> = keys()
         .iter()
